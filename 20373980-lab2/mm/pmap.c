@@ -134,7 +134,7 @@ static Pte *boot_pgdir_walk(Pde *pgdir, u_long va, int create)
         } else return 0; // exception
     }
 	/* Step 3: Get the page table entry for `va`, and return it. */
-	//获取va地址的页表条目，并返回。先将当前地址转化为耳机页表项地址，再组合成虚拟地址返回 
+	//获取va地址的页表条目，并返回。先将当前地址转化为二级页表项地址，再组合成虚拟地址返回 
 	return ((Pte *)(KADDR(PTE_ADDR(*pgdir_entryp)))) + PTX(va);
 }
 
