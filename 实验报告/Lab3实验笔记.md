@@ -2,7 +2,7 @@
 
 # O、前记
 
-​		从lab0到lab2，感觉之前做笔记的方法还是有代提高。先在，对基础的知识有了初步的认识后，我希望我的笔记能够更多的关注于代码。故而本次实验笔记中的记录方法可能和以前有所不同，而这都是建立在对知识有一定的理解之后的。
+​		从lab0到lab2，感觉之前做笔记的方法还是有代提高。先在，对基础的知识有了初步的认识后，我希望我的笔记能够更多的关注于代码。故而本次实验笔记中的记录方法可能和以前有所不同，而这都是建立在对知识有一定的理解之后的。另外，我认为，只从线性的层面梳理实验中要填写的代码，其实并不自然。在本次笔记中，我会尝试在线性结构和树状结构两方面来理解代码。
 
 ## 一、进程
 
@@ -106,7 +106,7 @@ int envid2env(u_int envid, struct Env **penv, int checkperm)
 }
 ```
 
-### Thinking 3.1
+#### Thinking 3.1
 
 ​		此处应当是加强了进程块拿取的判断条件。由于进程控制块数组中的进程控制块可能被替换分配，故而要确保所给`envid`拿取到id对应的正确的进程控制块。
 
@@ -158,7 +158,7 @@ env_setup_vm(struct Env *e)
 }
 ```
 
-### Thinking 3.2
+#### Thinking 3.2
 
 ​		UTOP是用户进程可读写的最高地址；ULIM是kuseg的最高地址。UTOP到ULIM间的区域用于存放用户进程控制块和页表，不能被用户随意读写。UTOP以下的空间可以被用户读写。
 
@@ -217,6 +217,16 @@ rfe
 ### 4.加载二进制镜像
 
 ​		2022.4.26，是我第一次写这一部分的笔记。说实在的，我现在并不是很清楚这个题目是什么意思、这里面函数之间有什么联系，只能先写一些零散的理解，日后还会回来补充。
+
+​		2022.4.27，今天思考了一下进程和程序的关系，好像对**加载二进制镜像**这个说法又有了一点理解。程序是一个静态的概念，一个`.c`文件就可以是一个程序；而进程是一个相对动态的概念，简单的理解，就是正在内存当中被执行的可执行文件。那么这和**加载二进制镜像**有什么关系呢？首先我们来看一下可执行文件的构造过程。以下图片来自CSDN。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190303220714301.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9seXktMDIxNy5ibG9nLmNzZG4ubmV0,size_16,color_FFFFFF,t_70#pic_center)
+
+​		可以看到，左边的一个C程序被编译连接成了右边的ELF文件，ELF文件在此处就是可执行文件。可执行文件的各个数据段存放了C文件的各段内容。可执行文件载入内存中运行就产生了进程。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190303221506277.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9seXktMDIxNy5ibG9nLmNzZG4ubmV0,size_16,color_FFFFFF,t_70#pic_center)
+
+​		看到这个图，突然感觉明朗了一些，略微明白了什么是**加载二进制镜像**。我们需要将ELF文件的内容一一映射到内存当中，才能够生成一个进程，且`.text`、`.data`等段的位置确实有镜像的味道了。而且有了这么一张图，栈的初始化等操作也更加容易理解。
 
 ​		创建新的进程后，我们需要为该进程分配空间来容纳程序代码。我们使用两个函数`load_icode_mapper()`和`load_icode()`来实现这一功能。前者将在后者中被调用，故而先讲解前面这一个函数。
 
@@ -335,7 +345,7 @@ int load_elf(u_char *binary, int size, u_long *entry_point, void *user_data,
 }
 ```
 
-### Thinking 3.3
+#### Thinking 3.3
 
 ​		`user_data`这一参数是`load_icode()`函数中的`Env *e`。这个参数必须存在，否则`load_elf()`函数无法向其函数参数`load_icode_mapper()`传递该参数。C语言的库函数中，快速排序函数qsort有着类似的行为：
 
@@ -345,7 +355,7 @@ void qsort(void *base, size_t n, size_t size, *int (*cmp)(const void *, const vo
 
 ​		`size`给`cmp()`函数传递了信息。至于具体是什么信息，我想这可能和C++中的STL有一些类似的行为，比如告知`cmp()`比较目标的大小；换句话说，也就是起到了自定义模版的作用。
 
-### Thinking 3.4
+#### Thinking 3.4
 
 ​		复制情况的不同主要是由`va`、`va+bin_size`和`va+sg_size`是否能对齐决定的。下面将情况列表展示。
 
@@ -361,3 +371,85 @@ void qsort(void *base, size_t n, size_t size, *int (*cmp)(const void *, const vo
 | 未对齐 |   未对齐    |   未对齐   |        这三者所在的页都需要特殊处理         |
 
 ​		最直接且暴力的方法就是处理最复杂的情况。我们使用`MIN()`函数，对相关的值进行比较来处理这些情况。具体方法已经写在笔记中了。注意，可能存在多种需要处理的情景在同一页面产生。
+
+#### Thinking 3.5
+
+​		`env_tf.pc`存储的是虚拟地址。CPU依靠`env_tf.pc`来寻找中断位置，那么这个域存储的自然是虚拟地址。
+
+​		`entry_point`在每个进程中都是一样的，这种统一是因为每个进程创建的方式都相同。新进程的创建，都是按照我们写好的进程创建函数逐步执行。不过需要注意，`entry_point`只是一个虚拟地址，并非物理地址，故而每个进程中`entry_point`可能映射到不同的物理地址。
+
+### 5.创建进程
+
+​		由于我们在上面已经写好了一系列声明、初始化的函数，创建进程这一部分的工作量并不大。在这里，我们需要填写两个函数来创建进程，分别是`env_create()`和`env_create_proirity()`。
+
+```C
+/* 使用env_create_priority()函数按照优先级创建进程 */
+/*** exercise 3.8 ***/
+void env_create(u_char *binary, int size) {
+		/* 根据传入的参数调用函数env_create_priority()即可 */
+  	env_create_priority(binary ,size , 1);
+}
+```
+
+​		另外一个函数稍微复杂一点。
+
+```C
+/* 使用env_alloc()声明一个新的进程控制块，并且使用load_icode()将二进制文件binary加载到内存中。将新的进程控制块置于管理链表中 */
+/*** exercise 3.8 ***/
+void env_create_priority(u_char *binary, int size, int priority) {
+    struct Env *e;
+		int r;
+		/* 使用env_alloc()声明一个新的进程控制块 */
+		if((r = env_alloc(&e, 0)) < 0) {
+				return;
+		}
+   	/* 给该控制块赋予优先级 */
+		e->env_pri = priority;
+    /* 加载二进制文件并且将控制块插入管理链表 */
+		load_icode(e, binary, size);
+		LIST_INSERT_HEAD(&env_sched_list[0], e, env_sched_link);
+}
+```
+
+​		使用我们之前写好的黑盒和一些宏就可以完成任务。这一部分的内容不难理解。
+
+### 6.进程的运行与切换
+
+​		还记得计组中的中断吗？在进入中断处理程序前，我们需要保存中断的位置和信息。同样，进程在发生切换的时候，我们也需要保存当前进程的周围环境（位置）和信息。这一部分的工作和驱动一个进程运行的工作结合了起来，在`env_run()`函数中实现。切换进程的流程为：
+
+- 保存当前进程信息和上下文信息
+- 切换`curenv`为即将执行的进程
+- 调用`lcontext()`函数，设置全局变量`mContext`为当前进程的页目录地址（之后TLB的部分会用到）
+- 调用`env_pop_tf()`汇编函数，恢复现场
+
+​		下面根据代码来进行解读。
+
+```C
+/* 进程运行函数 */
+/*** exercise 3.10 ***/
+void
+env_run(struct Env *e) {
+  /* 判断当前是否有进程运行，倘若有，使用Trapframe结构体保存当前进程的环境信息，并且拷贝到当前进程的env_tf域。然后，将env_tf.pc设置为env_tf.cp0.epc */
+    if(curenv != NULL) {
+				struct Trapframe *old;
+				old = (struct Trapframe *)(TIMESTACK - sizeof(struct Trapframe));
+				bcopy(old ,&(curenv->env_tf) ,sizeof(struct Trapframe));
+				curenv->env_tf.pc = curenv->env_tf.cp0_epc;
+		}	
+    /* 切换进程 */
+		curenv = e;
+    /* 调用函数。函数的具体信息目前还未了解，以后可能会补充 */
+		lcontext(e->env_pgdir);
+		env_pop_tf(&(e->env_tf) ,GET_ENV_ASID(e->env_id));
+}
+```
+
+​		到这里，Lab3第一部分的填补代码的内容就差不多完成了。
+
+#### Thinking 3.6
+
+​		`epc`是进程发生中断时的指令的地址，这个值存储在`env_tf.cp0_epc`中。在恢复该进程时，应当从发生中断的指令继续向下执行，而不应该从头开始执行。因此将`pc`值设为中断的指令地址，那么下一次进入这个进程时，程序便会从此开始执行。
+
+#### Thinking 3.7
+
+​		
