@@ -1,0 +1,363 @@
+# Lab3实验笔记
+
+# O、前记
+
+​		从lab0到lab2，感觉之前做笔记的方法还是有代提高。先在，对基础的知识有了初步的认识后，我希望我的笔记能够更多的关注于代码。故而本次实验笔记中的记录方法可能和以前有所不同，而这都是建立在对知识有一定的理解之后的。
+
+## 一、进程
+
+### 1.进程控制块
+
+​		首先介绍一个和内存控制块非常相似的东西：进程控制块。他被定义在`incldue/env.h`中。下面介绍其中一些比较重要的代码（并未列出全部）。
+
+```C
+struct Env {
+		/* env_tf，是一个Trapframe结构体，里面保存了进程的上下问环境，用于进程调度或是
+		陷入中断。这个结构体中有cp0_status、cp0_badvaddr、cp0_epc、pc等寄存器的信息 */
+  	struct Trapframe env_tf;       
+  	/* 和pp_link类似，使用它和env_free_list构建空闲进程链表，用于链接 */
+    LIST_ENTRY(Env) env_link;      // Free LIST_ENTRY 
+  	/* 进程id，独一无二。是不是想到了之前见过的进程标识符？ */
+    u_int env_id;                  // Unique environment identifier 
+  	/* 父进程id，一个进程可以被一个进程创建，故而存在父进程这一说法 */
+    u_int env_parent_id;           // env_id of this env's parent 
+  	/* 进程状态，一共有三种：ENV_FREE，进程空闲，这个块处于空闲链表；ENV_NOT_RUNNABLE，
+  	进程阻塞，当前不可执行，等待信息唤醒；ENV_RUNNABLE，进程处于执行或就绪状态*/
+    u_int env_status;              // Status of the environment 
+  	/*  这个变量保存了该进程页目录的内核虚拟地址 */
+    Pde *env_pgdir;                // Kernel virtual address of page dir 
+  	/* 这个变量保存了该进程页目录的物理地址 */
+    u_int env_cr3; 
+  	/* 这个变量用来构造调度队列 */
+    LIST_ENTRY(Env) env_sched_link; 
+  	/* 这个变量保存了该进程的优先级 */
+    u_int env_pri;
+};
+```
+
+​		在MOS系统中，放置内存进程块的物理内存在启动后就要安排好，即`envs`数组（和`pages`数组很相似），这一部分工作已经在`mips_vm_init()`实现了。代码如下：
+
+```C
+/* 开辟了NENV个Env结构体大小的空间，起始地址为envs */
+envs = (struct Env *)alloc(NENV * sizeof(struct Env), BY2PG, 1);
+/* 将NENV个Env大小的空间和页的大小进行对齐，即求出envs数组占用了多少页 */
+n = ROUND(NENV * sizeof(struct Env), BY2PG);
+/* 将[UENVS,UENVS+n)的虚拟地址映射到[PADDR(envs),PADDR(envs)+n)的物理地址上 */
+boot_map_segment(pgdir, UENVS, n, PADDR(envs), PTE_R);
+```
+
+​		阅读了这一部分代码后，我们能够体会到进程管理和内存管理的相似性，并且对进程相关的量有了初步的了解。下面我们按照提示来完成`exercise 3.2`。
+
+```C
+/* 此函数的作用是，将envs中所有的进程控制块标记为空闲状态，并且将它们插入env_free_list用于管理。注意，要将它们反过来插入链表，这样第一次使用函数env_alloc()分配进程时，调用的是envs[0] */
+/*** exercise 3.2 ***/
+env_init(void)
+{
+    int i;
+    /* Step 1: Initialize env_free_list. */
+  	/* 初始化env_free_list，可以使用链表宏 */
+    LIST_INIT(&env_free_list);
+    /* Step 2: Traverse the elements of 'envs' array,set their status as free and insert them into the env_free_list.Choose the correct loop order to finish the insertion.Make sure, after the insertion, the order of envs in the list should be the same as that in the envs array. */
+  	/* 遍历envs数组，将其中每个进程控制块的状态都设为空闲，并且插入env_free_list链表。注意，由于此处使用的是LIST_INSERT_HEAD()宏，在循环的时候要选择正确的顺序，以保证插入后链表的顺序和数组的顺序相同 */
+    for(i=NENV-1;i>=0;i--)
+    {
+        envs[i].env_status = ENV_FREE;
+        LIST_INSERT_HEAD(&env_free_list,&envs[i],env_link);
+    }
+}
+```
+
+### 2.进程的标识
+
+​		OS在同一时间段内可能会运行很多不同的进程，操作系统需要依靠**标识**来识别这些不同的进程。介绍进程控制块的时候，我们知道有一个`env_id`域可以用来标识进程。为了避免标识符产生冲突，`env.c`中实现了一个`mkenvid()`函数，用于给一个新创建的进程分配和当前未释放的进程的标识符都不同的标识符。
+
+​		还记得为什么需要标识符吗？当进程切换时，TLB根据虚拟地址判断重填情况。但是**不同进程**的**相同的虚拟地址**可能映射到**不同的物理页**，故而需要强化TLB充填的条件，通过增加标识符来解决这一问题。当然，我们的TLB只给ASID分配了6位，即最多可识别64个不同的进程，故而分配标识符不能用太过简单的方法，否则会导致进程溢出（这也是我们需要`mkenvid()`函数的原因）。当没有可分配标识符且需要创建新进程时，系统会panic，详见`asid_alloc()`函数。
+
+​		`exercise 3.3`要求我们填写`lib/env.c`中的`envid2env()`函数，令其可通过`env`的id来获取对应的进程控制块。
+
+```C
+/* 此函数的功能为，输入一个envid，可以将**penv指向该envid对应的进程控制块的指针。如果envid为0，那么令**penv指向为当前正在执行进程的结构体指针；否则，令它指向envs[ENVX(envid)]这一进程控制块的结构体的指针。另外，还有一个特殊的权限条件checkperm，需要函数根据实际情况做一些其他的判断。如果拿取控制块成功，则返回0；否则返回-E_BAD_ENV */
+/*** exercise 3.3 ***/
+int envid2env(u_int envid, struct Env **penv, int checkperm)
+{
+    struct Env *e;
+  	/* 如果envid为0，则拿取当前正在执行的进程的控制块的结构体指针，否则通过宏来获得目标控制块的结构体指针 */
+	if(envid == 0) {
+		*penv = curenv;
+		return 0;
+	} else {
+		e = &envs[ENVX(envid)];
+	}
+  	/* 如果当前进程控制块空闲（即这个控制块没有用来控制进程），或是拿取的进程控制块的id和当前所给的envid不同时，令**penv的内容为0，并且返回错误代码-E_BAD_ENV */
+    if (e->env_status == ENV_FREE || e->env_id != envid) {
+        *penv = 0;
+        return -E_BAD_ENV;
+    }
+  	/* 检查checkperm是否需要判断，倘若其被置1，那么envid的进程必须是当前进程或是当前进程的直接子进程，否则返回错误码 */
+	if(checkperm == 1) {
+		if(e != curenv && e->env_parent_id != curenv->env_id) {
+			*penv = 0;
+			return -E_BAD_ENV;
+		}
+	}
+
+    *penv = e;
+    return 0;
+}
+```
+
+### Thinking 3.1
+
+​		此处应当是加强了进程块拿取的判断条件。由于进程控制块数组中的进程控制块可能被替换分配，故而要确保所给`envid`拿取到id对应的正确的进程控制块。
+
+### 3.设置进程控制块
+
+​		配合空闲进程列表`env_free_list`，我们可以创建新的进程。创建进程的流程大致如下：
+
+1. 申请一个空闲的进程控制块（即Env结构体），这需要从`env_free_list`中拿取。
+2. 手动设置进程控制块的参数（现代操作系统中的进程一般都有模版支持，但MOS中没有）。
+3. 为进程分配资源。这其中包括了程序、数据、用户栈的空间。
+4. 从`env_free_list`中将进程块移除，进程创建完毕。
+
+​		在创建过程中，我们需要用到`env_alloc()`和`env_setup_vm()`这两个函数。其中，第一个函数要调用后面这一函数，故而我们先分析第二个函数。
+
+​		`env_setup_vm()`函数的作用是初始化新进程的地址空间，我们来接和注释进行分析。
+
+```C
+/* 初始化进程控制块指针e所指向的进程控制块的内核虚拟地址。首先，分配一个页面目录pgdir，并设置e中的env_pgdir和env_cr3，初始化env地址空间的内核部分。不要将任何东西映射到env虚拟地址空间的用户部分。 */
+/*** exercise 3.4 ***/
+static int
+env_setup_vm(struct Env *e)
+{
+    int i, r;
+    struct Page *p = NULL;
+    Pde *pgdir;
+		/* 为页目录声明一个页面p，使用page_alloc()函数声明。倘若声明失败，则返回错误码。然后，将新声明的内存控制块p标记为使用过（使用pp_ref++）。pgdir是e的页目录 */
+    if ((r = page_alloc(&p)) < 0) {
+        panic("env_setup_vm - page alloc error\n");
+        return r;
+    }
+  	/* 标记p的页面已经被使用 */
+		p->pp_ref++;
+  	/* 将pgdir设置为p所对应的内核虚拟地址 */
+		pgdir = (Pde *)page2kva(p);
+  	/* 将pgdir在UTOP以下的区域清零 */
+		for(i = 0;i < PDX(UTOP);i++) {
+				pgdir[i] = 0;
+		} 
+  	/* 将内核目录boot_pgdir的内容拷贝到pgdir */
+		for(i = PDX(UTOP);i <= PDX(~0);i++) {
+				pgdir[i] = boot_pgdir[i];
+		}
+  	/* 根据函数前的提示设置env_pgdir和env_cr3 */
+		e->env_pgdir = pgdir;
+		e->env_cr3 = PADDR(pgdir);
+    /* UVPT maps the env's own page table, with read-only permission.*/
+    e->env_pgdir[PDX(UVPT)]  = e->env_cr3 | PTE_V;
+    return 0;
+}
+```
+
+### Thinking 3.2
+
+​		UTOP是用户进程可读写的最高地址；ULIM是kuseg的最高地址。UTOP到ULIM间的区域用于存放用户进程控制块和页表，不能被用户随意读写。UTOP以下的空间可以被用户读写。
+
+​		`env_cr3`存储的是页目录的物理地址，`UVPT`的位置是自映射条件下，应存放页目录基地址的地址，此处将这一位置（即`pgdir[PDX(UVPT)]`）赋为`env_cr3`，建立了自映射。
+
+​		在lab2中，我们已经建立好了二级页表映射机制，完善了物理内存和虚拟内存管理机制。通过这一机制，我们可以在进程中使用虚拟地址，进程在使用虚拟地址时，根本上操纵的也是物理地址。
+
+​		刚刚，我们完善好了`env_setup_vm()`这一函数。前面我们已经提到过，这一函数是用在`env_alloc()`函数中的，接下来，我们便开始讲解这一个函数。
+
+```C
+/* 此函数的功能室创建并初始化一个新的进程。如果初始化成功，则将该进程的Env结构体指针填入*new并返回0，否则返回错误码。如果这个进程没有父进程，则其parent_id域应0，注意env_init()函数在此之前已经被调用过了。能够创建新进程的时候，要将Env结构体中的一些域设置为合适的值，它们是id、status、sp寄存器、CPU状态、parent_id */
+/*** exercise 3.5 ***/
+int env_alloc(struct Env **new, u_int parent_id)
+{
+    int r;
+    struct Env *e;
+		/* 首先，从env_free_list中得到一个Env结构体。此处首先判断env_free_list是否为空，为空则不能创建进程，返回错误码（此处可使用宏LIST_EMPTY）。如果不为空，则使用LIST_FIRST宏取出一个Env */
+		if(LIST_EMPTY(&env_freelist)) {
+				*new = NULL;
+				return -E_NO_FREE_ENV;
+		}
+		e = LIST_FIRST(&env_free_list);
+    /* 然后，调用一个特定的函数初始化这个Env结构体的内核布局。这个函数主要将内核地址映射到此Env的地址 */
+		env_setup_vm(e);
+    /* 再之后，初始化Env结构体的某些域，赋予它们合适的值 */
+		e->env_id = mkenvid(e);					//进程env_id，使用mkenvid()赋值
+		e->env_status = ENV_RUNNABLE;		//进程状态env_status，赋值为ENV_RUNNABLE
+		e->env_parent_id = parent_id;
+    /* 初始化有关sp寄存器的域个env_tf的cp0_status域；同时，设置栈指针，即29号寄存器的值为USTACKTOP，它是0x7f3fe000 */
+    e->env_tf.cp0_status = 0x10001004;
+		e->env_tf.regs[29]=USTACKTOP;
+    /* 从空闲链表中摘除该进程控制块 */
+		LIST_REMOVE(e,env_link);
+		*new = e;
+		return 0;
+}
+```
+
+​		讲解一句比较重要的代码:`e->env_tf.cp0_status = 0x10001004`。它和SR寄存器有关。
+
+![R3000的SR寄存器示意图](https://os.buaa.edu.cn/assets/courseware/v1/5ea075b45aaaa9f615d28fb2bd0cb342/asset-v1:BUAA+B3I062270+2022_SPRING+type@asset+block/3-R3000_SR.png)
+
+​		第28位置1，表示允许在用户模式下使用CP0寄存器；第12位置为1，表示4号中断可以被响应（计组的知识）。"另外，SR 寄存器的低六位是一个二重栈的结构。KUo和IEo是一组，每当中断发生的时候，硬件自动会将 KUp 和 IEp 的数值拷贝到这里；KUp 和 IEp 是一组，当中断发生的时候，硬件会把 KUc 和 IEc 的数值拷贝到这里。其中KU表示是否位于内核模式下，为1表示位于内核模式下；IE表示中断是否开启，为1表示开启，否则不开启。"
+
+​		"而每当rfe指令调用的时候，就会进行上面操作的**逆操作**。我们现在先不管为何,但是已经知道, 下面这一段代码 (位于`lib/env_asm.S` 中) 是**每个进程在每一次被调度时都会执行**的，所以就一定会执行rfe这条指令。"
+
+```
+lw k0,TF_STATUS(k0) # 恢复CP0_STATUS 寄存器
+mtc0 k0,CP0_STATUS
+j k1
+rfe
+```
+
+​		先在，我们大致明白为什么要将低六位设置为000100了。创建进程后，上面这段代码被调度，低六位就变成了000010，允许中断。这就是为什么要将`e->env_tf.cp0_status`设置为0x10001004了。
+
+### 4.加载二进制镜像
+
+​		2022.4.26，是我第一次写这一部分的笔记。说实在的，我现在并不是很清楚这个题目是什么意思、这里面函数之间有什么联系，只能先写一些零散的理解，日后还会回来补充。
+
+​		创建新的进程后，我们需要为该进程分配空间来容纳程序代码。我们使用两个函数`load_icode_mapper()`和`load_icode()`来实现这一功能。前者将在后者中被调用，故而先讲解前面这一个函数。
+
+```C
+/* 此函数是的用途是为进程加载ELF的二进制文件。当然，这个函数并不是单独使用的，它需要配合另一个函load_elf()使用，另一个函数帮助它解析了ELF文件的关键内容，并且传入这个函数。va是ELF文件的内核虚拟地址，sgsize是ELF文件的段大小,bin是二进制区域的起始位置，bin_size是二进制区域的大小，user_data在面去讲解 */
+/*** exercise 3.6 ***/
+static int load_icode_mapper(u_long va, u_int32_t sgsize, u_char *bin, u_int32_t bin_size, void *user_data)
+{
+    struct Env *env = (struct Env *)user_data;
+    struct Page *p = NULL;
+    u_long i = 0;
+    int r;
+    u_long offset = va - ROUNDDOWN(va, BY2PG);
+  	/* 首先将二进制文件的所有内容加载到文件当中。Env结构需要通过页面来使用这些数据，故而我们在将ELF文件的二进制内容复制到va对应的地址时，需要开辟页面并且传输给ENV结构体中的env_pgdir。这一部分的关键是按照页对齐的方式向va拷贝数据 */
+		/* Bad case:va is not round with BY2PG. */
+		if(offset != 0) {
+				if((r = page_alloc(&p)) < 0) {
+						return r;
+				}
+				page_insert(env->env_pgdir, p, va, PTE_R);
+    		/* This is prepare for the worst case. */
+				bcopy((void *)bin, (void *)(page2kva(p) + offset), MIN(bin_size, BY2PG - offset));
+				i = MIN(bin_size, BY2PG - offset);
+		}
+		for ( ; i < bin_size; i += BY2PG) {
+        /* 声明新的页面，不断的拷贝直至i增长到二进制文件的大小。注意考虑页对齐的情况 */
+				if((r = page_alloc(&p)) < 0) {
+						return r;
+				}
+				page_insert(env->env_pgdir, p, va + i, PTE_R);
+				/* MIN is prepare for the worst case. */
+				bcopy((void *)bin + i, (void *)page2kva(p), MIN(bin_size - i, BY2PG));
+    }
+    /* 拷贝完二进制文件后，将剩余的ELF文件段加载到内存中 */
+    while (i < sgsize) {
+				if((r = page_alloc(&p)) < 0) {
+						return r;
+				}
+				page_insert(env->env_pgdir, p, va + i, PTE_R);
+				i += BY2PG;
+    }
+    return 0;
+}
+```
+
+![每个segment的加载地址布局](https://os.buaa.edu.cn/assets/courseware/v1/f47fbf132dd55730e43cbebfc11d64be/asset-v1:BUAA+B3I062270+2022_SPRING+type@asset+block/Load_icode_mapper.png)
+
+​		之前我们提到了页面对齐，我们的确要在保证将ELF文件关键内容拷贝到va地址的同时保证页面的完整且对齐。我们需要控制的几个关键部分是`va`、`bin_size`和`sg_size`我们思考一下我们需要处理什么情况。
+
+​		最好的情况当然是`va`、`bin_size`和`sg_size`和BY2PG都对齐，这样我们只需要一直申请页面至`sg_size`即可。不过我们应该保证最坏的情况也能够被处理。最坏的情况是什么?那就是这三者都无法对齐，而我们需要在他们都无法对齐时照常分配页面，并且保证内容被拷贝到正确的地址上。下面我们来结合代码看看这一问题是如何解决的。
+
+```C
+u_long i = 0;
+int r;
+/* offset对应了上面图中的偏移 */
+u_long offset = va - ROUNDDOWN(va, BY2PG);
+/* 如果偏移不为0，即va无法对齐，那么先声明一个页面，用于应对第一页无法对齐的情况。r是错误码，声明发生错误时r得到的返回值小于0 */
+if(offset != 0) {
+		if((r = page_alloc(&p)) < 0) {
+				return r;
+		}
+  	/* 将新声明的页面插入到Env结构体的页目录中。这里使用page_insert()函数 */
+		page_insert(env->env_pgdir, p, va, PTE_R);
+		/* This is prepare for the worst case. */
+  	/* 将二进制文件的内容拷贝到目标位置。使用bcopy()函数进行拷贝。由于这是第一页，所以拷贝的起始位置是bin，拷贝的目标位置是page2kva(p)+offset，即va的地址。拷贝的长度为MIN(bin_size,BY2PG-offset)，这是考虑到了加载二进制文件后，可能还是只用到第一页的情况 */
+		bcopy((void *)bin, (void *)(page2kva(p) + offset), MIN(bin_size, BY2PG - offset));
+		i = MIN(bin_size, BY2PG - offset);
+}
+/* 解决了第一个页面的问题后，倘若i小于bin_size，我们开始处理剩下的页面 */
+for ( ; i < bin_size; i += BY2PG) {
+    	/* 声明新页面的操作和前面类似 */
+			if((r = page_alloc(&p)) < 0) {
+					return r;
+			}
+			page_insert(env->env_pgdir, p, va + i, PTE_R);
+			/* MIN is prepare for the worst case. */
+  		/* 此处是考虑i+bin_size，即二进制内容的末尾和BY2PG无法对齐的情况。拷贝的长度变为MIN(bin_size-i,BY2PG)，这是为了处理最后一页无法对齐的情况 */
+			bcopy((void *)bin + i, (void *)page2kva(p), MIN(bin_size - i, BY2PG));
+}
+```
+
+​		加载完二进制文件的内容，若`bin_szie`小于`sgsize`，还需要将页面申请直至增长到`sgsize`。后面的情况的处理思路和前面类似。
+
+​		这个函数到此也就完善好了，不过我们提到，它还要结合另一个函数来发挥作用，那就是定义在`include/lib`下的`kernel_elfloader.c`中的`load_elf()`函数。
+
+```C
+/* 此函数的作用是加载一个二进制的ELF，并将其所有的节都映射到正确的虚拟地址上。其二进制部分binary不能为空，且参数size是ELF文件二进制部分的大小。如果加载成功，binary的指针将被存储在start中 */
+/*** exercise 3.7 ***/
+int load_elf(u_char *binary, int size, u_long *entry_point, void *user_data,
+			 int (*map)(u_long va, u_int32_t sgsize, u_char *bin, u_int32_t bin_size, void *user_data)) {
+		Elf32_Ehdr *ehdr = (Elf32_Ehdr *)binary;
+		Elf32_Phdr *phdr = NULL;
+		u_char *ptr_ph_table = NULL;
+    Elf32_Half ph_entry_count;
+    Elf32_Half ph_entry_size;
+    int r;
+		/* 检查binary是否是二进制文件 */
+		if (size < 4 || !is_elf_format(binary)) {
+    		return -1;
+    }
+		ptr_ph_table = binary + ehdr->e_phoff;
+    ph_entry_count = ehdr->e_phnum;
+    ph_entry_size = ehdr->e_phentsize;
+		while (ph_entry_count--) {
+    		phdr = (Elf32_Phdr *)ptr_ph_table;
+				if (phdr->p_type == PT_LOAD) {
+          	/* 调用函数进行映射 */
+						if((r = map(phdr->p_vaddr, phdr->p_memsz, binary + phdr->p_offset, phdr->p_filesz, user_data)) < 0) {
+    						return r;
+						}	
+    		}
+    		ptr_ph_table += ph_entry_size;
+    }
+    *entry_point = ehdr->e_entry;
+    return 0;
+}
+```
+
+### Thinking 3.3
+
+​		`user_data`这一参数是`load_icode()`函数中的`Env *e`。这个参数必须存在，否则`load_elf()`函数无法向其函数参数`load_icode_mapper()`传递该参数。C语言的库函数中，快速排序函数qsort有着类似的行为：
+
+```C
+void qsort(void *base, size_t n, size_t size, *int (*cmp)(const void *, const void *));
+```
+
+​		`size`给`cmp()`函数传递了信息。至于具体是什么信息，我想这可能和C++中的STL有一些类似的行为，比如告知`cmp()`比较目标的大小；换句话说，也就是起到了自定义模版的作用。
+
+### Thinking 3.4
+
+​		复制情况的不同主要是由`va`、`va+bin_size`和`va+sg_size`是否能对齐决定的。下面将情况列表展示。
+
+|   va   | va+bin_size | va+sg_size |                    备注                     |
+| :----: | :---------: | :--------: | :-----------------------------------------: |
+|  对齐  |    对齐     |    对齐    |                最理想的情况                 |
+|  对齐  |    对齐     |   未对齐   |        va+sg_size所在页需要特殊处理         |
+|  对齐  |   未对齐    |    对齐    |        va+bin_size所在页需要特殊处理        |
+|  对齐  |   未对齐    |   未对齐   | va+sg_size和va+bin_size所在页都需要特殊处理 |
+| 未对齐 |    对齐     |    对齐    |            va所在页需要特殊处理             |
+| 未对齐 |    对齐     |   未对齐   |     va和va+sg_size所在页都需要特殊处理      |
+| 未对齐 |   未对齐    |    对齐    |     va和va+bin_size所在页都需要特殊处理     |
+| 未对齐 |   未对齐    |   未对齐   |        这三者所在的页都需要特殊处理         |
+
+​		最直接且暴力的方法就是处理最复杂的情况。我们使用`MIN()`函数，对相关的值进行比较来处理这些情况。具体方法已经写在笔记中了。注意，可能存在多种需要处理的情景在同一页面产生。
