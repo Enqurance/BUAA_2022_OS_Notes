@@ -169,7 +169,7 @@ env_setup_vm(struct Env *e)
 ​		刚刚，我们完善好了`env_setup_vm()`这一函数。前面我们已经提到过，这一函数是用在`env_alloc()`函数中的，接下来，我们便开始讲解这一个函数。
 
 ```C
-/* 此函数的功能室创建并初始化一个新的进程。如果初始化成功，则将该进程的Env结构体指针填入*new并返回0，否则返回错误码。如果这个进程没有父进程，则其parent_id域应0，注意env_init()函数在此之前已经被调用过了。能够创建新进程的时候，要将Env结构体中的一些域设置为合适的值，它们是id、status、sp寄存器、CPU状态、parent_id */
+/* 此函数的功能是创建并初始化一个新的进程。如果初始化成功，则将该进程的Env结构体指针填入*new并返回0，否则返回错误码。如果这个进程没有父进程，则其parent_id域应0，注意env_init()函数在此之前已经被调用过了。能够创建新进程的时候，要将Env结构体中的一些域设置为合适的值，它们是id、status、sp寄存器、CPU状态、parent_id */
 /*** exercise 3.5 ***/
 int env_alloc(struct Env **new, u_int parent_id)
 {
@@ -452,4 +452,73 @@ env_run(struct Env *e) {
 
 #### Thinking 3.7
 
-​		
+​		在执行`sched_yield()`函数前，`KERNEL_SP`的一个`Trapframe`大小的内容被存到了`TIMESTACK`区域。这应该是一个用于保存现场的栈区，至于`sched_yield()`函数有什么作用，为什么要这样存储，刚做完第一部分的我可能还无法回答。
+
+​		`TIMESTAKC`，顾名思义，显然发生时钟中断时的栈指针。`KERNEL_SP`是发生其他中断时的栈指针。
+
+## 二、异常与中断
+
+### 1.引言
+
+​		首先搬运指导书的部分内容，来回顾计组P7有关协处理器CP0的部分知识。CP0中有许多寄存器，我们回顾以下三个寄存器。
+
+| 寄存器助记符 | CP0寄存器编号 |                  描述                   |
+| :----------: | :-----------: | :-------------------------------------: |
+|      SR      |      12       | 状态寄存器，包括中断使能位和CPU模式位等 |
+|    Cause     |      13       |           记录导致异常的原因            |
+|     EPC      |      14       |      异常结束后程序恢复执行的位置       |
+
+​		SR寄存器的区域划分如下：
+
+![SR寄存器](https://os.buaa.edu.cn/assets/courseware/v1/5ea075b45aaaa9f615d28fb2bd0cb342/asset-v1:BUAA+B3I062270+2022_SPRING+type@asset+block/3-R3000_SR.png)
+
+​		低六位的功能在前面已经介绍过了；IM区域是我们在计组课程中主要关注的区域。其中，8-9位是软件可写的中断位，10-15位对应了六种外部中断的使能位。
+
+​		Cause寄存器的区域划分如下：
+
+![CR寄存器](https://os.buaa.edu.cn/assets/courseware/v1/6aaccc4a7f7b235b872e6ac3f8b1b091/asset-v1:BUAA+B3I062270+2022_SPRING+type@asset+block/3-CauseRegister.png)
+
+​		8-15位和SR寄存器的响应位相对应，记录了哪些中断和异常是已经发生的。ExcCode是异常标识码，记录异常发生的原因。在计组课程中，异常发生的原因有ALU溢出、取址不对齐等。
+
+​		MIPS处理异常时要执行以下几个步骤：
+
+1. 设置EPC，记录异常结束时需要返回的地址
+2. 设置SR的相应位，使CPU进入内核态，关闭外部中断
+3. 设置Cause寄存器，记录异常发生的原因
+4. CPU进入异常处理程序
+
+​		最后一个部分就是本部分我们要完成的内容。
+
+### 2.异常的分发
+
+​		在计组课程中，每当CPU触发异常，我们都会跳到一个0x4180的地址，进入异常处理程序。在MOS中，我们也要实现相应的功能，即当出现异常时，处理器能够根据异常码的种类跳转到相应的异常处理代码处。
+
+​		`exercise3.12`要求我们将下一部分代码添加到`strat.S`中。
+
+```Mipsasm
+NESTED(except_vec3, 0, sp)
+    .set noat 
+    .set noreorder
+1:
+    mfc0 k1,CP0_CAUSE					//将CP0_CAUSE寄存器的内容写入k1寄存器
+    la k0,exception_handlers	//将exception_handlers（异常处理程序的地址）这一地址写入k0寄存器
+    andi k1,0x7c							//取出2-6位的异常码，写回k1
+    addu k0,k1								//使用k0的地址加上k1的内容
+    lw k0,(k0)								//将k0的值存到其对应的地址处，相当于堆栈
+    nop
+    jr k0											//跳转到k0寄存器的值所对应的地址处，即中断处理函数的入口地址
+    nop
+END(except_vec3)
+.set at
+```
+
+​		`exc_vec3`段这一地址存放的是异常处理程序的入口地址。一旦 CPU 发生异常，就会自动跳转到地址 0x80000080 处，开始执行。将下面的代码加入`scse0_3.lds`中即是`exercise3.13`的内容。
+
+```
+. = 0x80000080;
+.except_vec3 : {
+    *(.text.exc_vec3)
+}
+```
+
+### 3.异常向量组
