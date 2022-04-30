@@ -522,3 +522,65 @@ END(except_vec3)
 ```
 
 ### 3.异常向量组
+
+​		前面提到的异常处理程序`ecxeption_handlers`还有一个名字， 就是异常向量组。它是定义在`lib/traps.c`中的一个`unsigned long`类型的数组，有32位。在这个文件中，我们做了对这一数组的初始化操作，即把相应异常码对应的异常处理函数的地址，填入到这个数组当中，以便操作系统能够根据异常码调用异常处理函数。
+
+```C
+extern void handle_int();
+extern void handle_reserved();
+extern void handle_tlb();
+extern void handle_sys();
+extern void handle_mod();
+unsigned long exception_handlers[32];
+
+void trap_init()
+{
+    int i;
+    for (i = 0; i < 32; i++) {
+        set_except_vector(i, handle_reserved);
+    }
+
+    set_except_vector(0, handle_int);		//0号异常，实际上是中断，包括时钟中断、控制台中断等
+    set_except_vector(1, handle_mod);		//1号异常，标识存储异常，程序对被标记为只读页面进行了写操作
+    set_except_vector(2, handle_tlb);		//2号异常，TLB异常，TLB中没有和程序地址匹配的有效入口
+    set_except_vector(3, handle_tlb);		//3号异常，TLB异常，TLB失效切不在异常中（异常处理较快）
+    set_except_vector(8, handle_sys);		//8号异常，系统调用，即执行syscall导致系统陷入内核态
+}
+
+void *set_except_vector(int n, void *addr)
+{
+    unsigned long handler = (unsigned long)addr;
+    unsigned long old_handler = exception_handlers[n];
+    exception_handlers[n] = handler;
+    return (void *)old_handler;
+}
+```
+
+​		我们在MOS实验中主要使用的是0号异常。
+
+### Thinking 3.8
+
+- `handle_int`定义在`lib/genex.S`中，直接以mips中函数的形式给出。
+
+- `handle_mod`、`handle_tlb`、`handle_reserved`这三个函数也是在`lib/genex.S`中实现的，不过它们的实现方法比较特殊。 咋一看，好像定义了很多函数，但和这三个函数没有任何的联系，不过我们来到文件末尾，会找到这样一段代码：
+
+  ```
+  BUILD_HANDLER reserved do_reserved cli
+  BUILD_HANDLER tlb   do_refill   cli
+  BUILD_HANDLER mod   page_fault_handler cli
+  ```
+
+  出现了熟悉的单词，但还仅仅是局部相似，不过确实可以找到`reserve`对应的`do_reserve`函数，`tlb`对应的`do_refill`函数，证明我们的寻找方向是正确的。我们可以猜测，这些函数的定义可能和`BUILD_HANDLER`有关。于是我们试着追溯一下它的源头，发现它正是定义在文件开头的一个宏：
+
+  ```
+  .macro  BUILD_HANDLER exception handler clear
+      .align  5
+      NESTED(handle_\exception, TF_SIZE, sp)
+      .set    noat
+  ```
+
+  虽然不能完全明白这里的MIPS语法，但从`handle_\exception`可以看出，这里略有拼接的味道了，再结合之前的分析，我们可以肯定这三个函数也是定义在`lib/genex.S`下的。
+
+- 前面几个函数都是定义在`.S`文件中的汇编函数，那么`handle_sys`函数也应当是如此。在`lib`目录下，可以找到一个`syscall.S`文件，`handle_sys`函数正是在其中实现。
+
+### 4.时钟中断
