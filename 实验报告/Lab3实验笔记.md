@@ -584,3 +584,112 @@ void *set_except_vector(int n, void *addr)
 - 前面几个函数都是定义在`.S`文件中的汇编函数，那么`handle_sys`函数也应当是如此。在`lib`目录下，可以找到一个`syscall.S`文件，`handle_sys`函数正是在其中实现。
 
 ### 4.时钟中断
+
+​		本部分只有一个`exercise3.14`，且只用写一个简单的函数，就不再介绍这一部分的内容了。主要讲解时钟中断有关的知识。
+
+​		首先来了解一下gxemul是如何模仿时钟中断的。首先，我们在`kclock_init()`函数中对时钟的信息进行了初始化。此函数调用了`set_timer()`汇编函数（这也是我们`exercise3.14`的内容），`set_timer()`定义在`kclock_asm.S`中。其内容大致如下：
+
+```Mipsasm
+LEAF(set_timer)
+		
+		//向t0寄存器中写入0xc8
+    li t0, 0xc8					
+    //向0xb5000100中写入0xc8。0xb5000000是gxemul映射实时钟的位置，后者代表一秒钟触发中断200次
+    sb t0, 0xb5000100		
+    //其它的初始化操作
+    sw  sp, KERNEL_SP
+setup_c0_status STATUS_CU0|0x1001 0
+    jr ra
+
+    nop
+END(set_timer)
+```
+
+​		我们继续往前看。前面提到过，在发生时钟中断的时候，我们的程序将进入异常处理函数`handle_int`。
+
+```
+NESTED(handle_int, TF_SIZE, sp)
+.set    noat
+
+//1: j 1b
+nop
+
+SAVE_ALL
+CLI
+.set    at
+mfc0    t0, CP0_CAUSE
+mfc0    t2, CP0_STATUS
+and t0, t2
+
+andi    t1, t0, STATUSF_IP4
+bnez    t1, timer_irq
+nop
+END(handle_int)
+```
+
+​		首先，函数执行了一个`SAVE_ALL`宏，这个宏也是一个汇编函数，它将寄存器堆的内容和协处理器CP0的部分内容保存到了栈中。其函数的部分非常长，就不在此列出，只描述它的执行流程。
+
+- 取出CP0中SR寄存器的内容，根据28位的内容，判断当前CPU是否处于用户模式下
+- 将运行栈的地址保存到k0寄存器中
+- 然后调用 get_sp 宏，根据中断异常的种类判断需要保存的位置
+- 将运行栈地址即k0寄存器的内容推栈
+- 将寄存器堆的内容和CP0部分寄存器的内容推栈
+
+​		接下来，函数执行另外一个宏`CLI`，它设置了SR寄存器的`CU0`位和`IEc`位，修改操作系统的状态并标记中断已开启。然后，它对CP0_CAUSE的第四位进行判断，判断是否是时钟引起的中。如果是，则转而执行函数`timer_irq`；在后者中，还会跳转到另一函数`shced_yield`处执行程序。这一函数的内容大致如此，一些细节日后还可能会补充。
+
+### Thinking 3.9
+
+​		首先来解释`set_timer`函数。
+
+```
+.macro  setup_c0_status set clr
+		//.set push是一条为指令，貌似是指示汇编器保存当前的汇编状态。在Mars中，其好像已经表为无用
+    .set    push
+    //将SR寄存器的内容存入t0寄存器
+    mfc0    t0, CP0_STATUS
+    //将t0寄存器的内容与STATUS_CU0|0x1001取或并写回，其内容应当是0x10001001
+    or  t0, \set|\clr
+    //将t0寄存器的内容与0取或并写回。此时t0寄存器的28位、12位、0位都置1
+    xor t0, \clr
+    //写回SR寄存器，写回值的意义参考SR寄存器的描述。
+    mtc0    t0, CP0_STATUS
+    //恢复原有的汇编状态
+    .set    pop
+.endm
+
+LEAF(set_timer)
+		
+		//向t0寄存器中写入0xc8
+    li t0, 0xc8					
+    //向0xb5000100中写入0xc8。0xb5000000是gxemul映射实时钟的位置，后者代表一秒钟触发中断200次
+    sb t0, 0xb5000100		
+    //将栈指针寄存器的内容存入内存中内核栈的位置
+    sw  sp, KERNEL_SP
+    //调用宏setup_c0_status，传入set参数为STATUS_CU0|0x1001，clr参数为0
+		setup_c0_status STATUS_CU0|0x1001 0
+		//跳转到ra寄存器的内容，即回到调用其的函数处继续执行程序
+    jr ra
+    nop
+END(set_timer)
+```
+
+​		接下来看一看`timer_irq`函数。
+
+```
+timer_irq:
+		//向0xb5001100写入0x0。该位置应当与时钟相关
+    sb zero, 0xb5000110
+    //跳转到sched_yield函数执行
+1:  j   sched_yield
+    nop
+    /*li t1, 0xff
+    lw    t0, delay
+    addu  t0, 1
+    sw  t0, delay
+    beq t0,t1,1f    
+    nop*/
+    //跳转到ret_from_exceptio处执行
+    j   ret_from_exception
+    nop
+```
+
