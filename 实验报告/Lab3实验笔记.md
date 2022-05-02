@@ -693,3 +693,50 @@ timer_irq:
     nop
 ```
 
+### 5.进程调度
+
+​		时钟中断在此处是一种特殊的中断。之所以产生时钟中断，是为了在我们的操作系统中能够实现时间片轮转调度算法；而进程的切换需要系统进入中断。
+
+​		我们在上面已经完成了"让系统能够正确进入中断服务函数"的工作。为了使时钟中断与轮转调度结合，我们需要在中断处理函数中完善`sched_yield()`函数，用于进程的分发调度。
+
+```C
+void sched_yield(void)
+{
+	/* static变量只会在第一次生命的时候被赋值，以后的声明语句无效 */
+	static int count = 0; 
+  static int point = 0;
+	static struct Env *e = NULL;
+  /* 倘若时间片count用完了，或者是进程不再处于可执行态，则需要切换进程 */
+	if(count <= 0 || e->env_status != ENV_RUNNABLE) {
+		do {
+      /* 倘若当前point的队列为空，则切换到另外一个队列 */
+			if(LIST_EMPTY(&env_sched_list[point])) {
+				point = 1 - point;
+			}
+			
+      /* 取出当前point所指队列的第一个进程控制块 */
+			e = LIST_FIRST(&env_sched_list[point]);			
+
+      /* 如果该控制块不满足条件且不为NULL，那么将其插入队列尾部 */
+			if(e != NULL) {
+				LIST_REMOVE(e, env_sched_link);
+				LIST_INSERT_TAIL(&env_sched_list[1 - point], e, env_sched_link);
+        /* 为进程分配时间片，其值为之前分配给进程的pri */
+				count = e->env_pri;
+			}
+    /* 控制块满足条件，跳出循环 */
+		} while (e == NULL || e->env_status != ENV_RUNNABLE);
+	}
+  /* 进程执行，执行前时间片自减1 */
+	count--;
+	env_run(e);
+}
+```
+
+### Thinking 3.10
+
+​		进程执行时，时钟会按照已有频率触发中断且提供属于自己的中断码。OS能够根据中断码跳转到特殊的中断处理程序——时钟中断处理程序对应的内容就是进程切换。我们在之前已经完成了保护现场、程序跳转等一系列工序，在此处只需按照轮转调度算法执行即可。
+
+​		时钟每中断一次，都会进入一次`sched_yield()`，时间片`count`减一；当时间片用完，就会队列中选取满足条件的进程进行执行。
+
+​		Lab3的实验笔记大致如此。
