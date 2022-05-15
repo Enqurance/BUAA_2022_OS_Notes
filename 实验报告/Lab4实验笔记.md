@@ -138,6 +138,8 @@ NESTED(handle_sys,TF_SIZE, sp)
 END(handle_sys)
 ```
 
+​		**5.15补充：**今天回顾了一下系统调用机制的部分，重新梳理了系统调用机制的实现过程。即将进行系统调用的时候，调用顺序是这样的：`syscall_*()`、`msyscall()`、`syscall`、`handle_sys()`、`sys_*()`。`syscall_*()`是一个带有六个参数的函数，第一个参数是系统调用号；`msyscall`是一个汇编函数，里面仅仅有两条有效指令即`syscall`和`jr`，`handle_sys()`则是`syscall`后进入的处理函数。指导书中有一处写道"而且函数的第一个参数都是一个与调用名相似的宏......把这个参数称为**系统调用号**......系统调用号是内核区分这究竟是何种系统调用的唯一依据。"第一次阅读指导书的时候，我对此处感到困惑，因为`msyscall()`这一汇编函数根本不带任何参数，但是`sysccall_*()`函数却传了六个参数，这是怎么做到的？今天再仔细想了一下，突然发现自己之前将C语言和汇编语言割裂了，C语言最终还是会被编译为汇编语言执行，那么就可以用汇编语言的参数传递方式来理解此处的参数传递了，即使用`$a`系列寄存器和栈帧传递。理解了这一部分，我在上面提到的"不能完全明白"的一些问题也迎刃而解了。`handle_sys()`中，由于内核已经提前向栈中保存了Trapframe，故而有些值可以用栈指针寄存器方寸。连续向`$a`中写入四个值同时`sw`压栈两次，是为了准备下一次跳转的`sys_*()`函数提供参数，这样系统调用机制函数之间的关系也更明晰了。
+
 ### Thinking 4.1
 
 - 保存现场时，内核会使用一个汇编宏函数`SAVE_ALL`，将相关通用寄存器的值保存到栈帧中。
@@ -383,4 +385,389 @@ int main() {
 
 ​	写时复制机制的实现思路大致如下：在执行fork函数之后，内核在给子进程配置环境的时候，会将共享页面的`PTE_COW`权限置为有效。随后进程执行的时候，倘若仅对这些页面进行读操作，那么会被认为是安全的；倘若某个进程对他们进行了写操作，那么就会产生异常，进入异常处理函数。在异常处理函数中，内核会解除原来虚拟页面的映射，并将其映射到一个新的物理页面，将原物理页面的内容拷贝到新页面中，同时取消虚拟页面的`PTE_COW`标记。写时复制机制保证仅当进程修改共享页面时才重新分配物理页面，能够节省相当的空间和时间。
 
-​		
+### 3.子进程的创建
+
+​		前面提到过，在Linux系统当中，fork函数实际上是一个封装好的系统调用API，即其实现功能的根本依赖还是系统调用。可以借鉴指导书的流程图来观察这个过程。
+
+<img src="https://os.buaa.edu.cn/assets/courseware/v1/ec04bb966e3083678fe5dcabe84273ee/asset-v1:BUAA+B3I062270+2022_SPRING+type@asset+block/4_fork_process.png" alt="fork 流程图" style="zoom:50%;" />
+
+​		可见，子进程是父进程通过调用`syscall_env_alloc()`函数及之后一系列函数创建的。父进程通过通过系统调用，从内核态返回用户态时恢复现场；而子进程则是在进程被调度时返回用户态时恢复现场。系统调用使得他们返回现场时`$v0`寄存器储存的值不相同，故而可以通过进程id区分父子进程。
+
+​		在`syscall_env_alloc()`中，我们开辟了一个新的进程。随后我们需要将当前进程的一些信息填入这个新的进程当中。
+
+```C
+int sys_env_alloc(void)
+{
+    // Your code here.
+    int r;
+    struct Env *e;
+  	/*  申请一个新的进程控制块 */
+    if((r = env_alloc(&e, curenv->env_id)) < 0) return r;
+  	/* 将当前栈的内容，即curenv的栈的内容，拷贝到目标进程的栈空间当中 */
+    bcopy((void *)KERNEL_SP - sizeof(struct Trapframe),
+          (void *)&(e->env_tf),
+          sizeof(struct Trapframe));
+  	/* 设置进程控制块的相关值 */
+  	/* 将pc寄存器的值设置为系统调用发生时的后一条地址，即保证返回时从系统调用下一条指令继续执行 */
+    e->env_tf.pc = e->env_tf.cp0_epc;
+  	/* 覆盖返回值，子进程中$v0寄存器得到的值为0 */
+    e->env_tf.regs[2] = 0;
+  	/* 设置子进程为阻塞状态，需要等待父进程完成创建后再唤醒 */
+    e->env_status = ENV_NOT_RUNNABLE;
+  	/* 设置子进程的优先级 */
+    e->env_pri = curenv->env_pri;
+    return e->env_id;
+    //  panic("sys_env_alloc not implemented");
+}
+```
+
+### 4.进程分岔
+
+​		MOS操作系统允许进程访问自身的进程控制块。用户程序在入口会将一个指针变量指向当前进程的进程控制块。我们在创建子进程的同时需要修改这个值，使其指向自身进程的进程控制块。这是`exercise4.9`的内容。
+
+```C
+/* 得到系统调用sys_env_alloc的返回值。注意，newenvid的值获得已经是在系统调用结束之后，故而此时已经发生了进程分岔 */
+newenvid = syscall_env_alloc();
+/* 如果改进程为新创建的子进程，即系统调用函数返回值为0，则设置env */
+if(newenvid == 0) {
+	/* 使用系统调用得到当前进程的id，并从进程控制块数组中得到该进程赋给env */
+  env = &envs[ENVX(syscall_getenvid())];
+  return 0;
+}
+```
+
+​		以上是子进程在fork函数中执行的最后一个部分，因为子进程的id为0，很快就将从fork函数中返回。但仅仅如此，子进程还不足以运行起来，我们还需要在父进程的fork函数中设置一些有关于子进程的内容。
+
+​		回想一下，首先我们需要设置子进程的页面。使其能够和父进程共享物理内存空间。此时，我们需要遍历父进程的用户空间页（也就是kuseg空间），并且设置`PTE_COW`将这些页面进行保护（原因已经在**写时复制机制**时提及）
+
+​		在`exercise4.10`中，我们需要对`USTACKTOP`以下的空间进行`duppage()`操作，将这一部分的空间共享给父子进程；同时，我们还需要给某些页面设置`PTE_COW`权限，以确保**写时复制机制**的正常实现。首先我们在`fork.c`中进行页面遍历，这部分在`syscall_env_alloc()`之后。
+
+```C
+		/* 将USTACKTOP以下的页面duppage */
+    for(i = 0;i < USTACKTOP;i += BY2PG) {
+        /* 用*vpd取出地址i对应的一级页表表项，不为空则继续 */
+        if((Pde *)(*vpd)[i >> PDSHIFT]) {   //PDSHITF equals 22
+            /* 用*vpt取出地址i对应的二级页表表项，又不为空表示该页面的确存在，可duppage */
+            if((Pte *)(*vpt)[i >> PGSHIFT]) {   //PGSHIFT equals 12
+                /* VPN(i)是i对应的虚拟页号 */
+                duppage(newenvid, VPN(i));
+            }
+        }
+    }
+```
+
+​		接下来，我们来关注`duppage()`函数的实现。
+
+```C
+static void
+duppage(u_int envid, u_int pn)
+{
+    u_int addr;
+    u_int perm;
+    /* addr为pn这一虚拟页号对应的虚拟地址 */
+    addr = pn * BY2PG;      //Get the value of 'addr'.
+    /* 从二级页表中取出pn对应的页表项，并拿取低12位的权限位 */
+    perm = ((*vpt)[pn]) & 0xfff;
+    /* 如果该页面的权限不是PTE_R，或者是PTE_LIBRARY，或者是PTE_COW，按照原页面的权限进行
+     * 映射，此时只需要映射子进程 */
+    if(((perm & PTE_R) == 0) || (perm & PTE_LIBRARY) || (perm & PTE_COW)) {
+        if(syscall_mem_map(0, addr ,envid ,addr ,perm) < 0) {
+            user_panic("duppage not implemented\n");
+        }
+    } else {
+        /* 否则该页面的权限有变，在父子进程中都需要重新设置标志位 */
+        if(syscall_mem_map(0 ,addr ,envid ,addr ,perm | PTE_COW) < 0) {
+            user_panic("duppage not implemented\n");
+        }
+        if(syscall_mem_map(0 ,addr ,0 ,addr ,perm | PTE_COW) < 0) {
+            user_panic("duppage not implemented\n");
+        }
+    }
+    //  user_panic("duppage not implemented");
+}
+```
+
+​		`duppage()`后，页面的权限设置就完成了。不过到此，子进程还不能被唤醒，因为我们仅仅是给页面设置了标志位，还没有完成写时复制机制。
+
+### Thinking 4.5
+
+​		用户空间的大部分区域都需要进行映射，内核空间则不需要。对于每个分区，我们进行如下分析：
+
+- `UTOP`到`ULIM`的区域存储了`envs`数组、`pages`数组等关键信息，这一部分可以被访问，但是不可被修改，其已经被保护好，不需要在再进行保护。
+- `USTACKTOP`到`UTOP`的区域为`Invalid memory`和用户异常栈，不能设置写时保护。
+
+​		`USTACKTOP`以下的页面都是需要进行写时保护的。
+
+### Thinking 4.6
+
+​		vpt为二级页表的起始地址（所有的二级页表的起始），vpd为一级页表的起始地址。我们来一步一步地追溯它们的本源。
+
+​		首先，我们可以在`mmu.h`中找到他们被定义为数组的地方:
+
+```C
+typedef u_long Pde;
+typedef u_long Pte;
+
+extern volatile Pte* vpt[];
+extern volatile Pde* vpd[];
+```
+
+​		可见，这两个变量的本质都是`u_long`类型的指针，指向改类型的数组。那么他们的值在哪里被定义呢？我们来到`entry.S`中，发现这个汇编文件中，定义了`vpt`和`vpd`这两个宏。其中，`vpt`为一个字，其中填充了`UVPT`；而`vpd`则要复杂一些，它所对应的字中填充了` (UVPT+(UVPT>>12)*4)`。咋一看是否有点眼熟？这时候我们会发现，兜兜转转又回到了`mmu.h`中，我们可以在内存地图上看到`UVPT`的地址，就是`0x7fc00000`，也就是二级页表的起始地址。到这里，这两个变量的意义就已经明晰了。
+
+​		由于这两者根据其存放在内存中的位置实现了内存自映射机制，故而我们的进程可以通过访问内存来访问一级页表，进而访问二级页表，进而访问其自身的整个页表。
+
+​		二级页表的起始位置在`0x7fc00000`，这个位置往上4KB的内存空间对应的是`(UVPT>>12)`的虚拟页面。要实现自映射机制，一级页表的起始位置应当在二级页表中，且我们知道一级页表中的第一个32位数应当能拿取到第一个二级页表所在页的虚拟地址，而二级页表的第一个32位数则能取到所有页中的第一个页，故而一级页表的第一个32位数应当相对`UVPT`发生偏移，需要偏移`(UVPT>>12)`个bit即`(UVPT>>12)*4)`个字节。
+
+​		用户进程无法修改页表项。
+
+### 5.页写入异常
+
+​		内核捕捉到缺页中断时，即TLB缺失，将会进入异常处理状态，处理该异常的向量已经在lab3中填写好了，其对应的异常码为8，异常处理函数为`handle_tlb`。该函数定义在`genex.S`中，化名为`do_refill`（详见lab3的思考题解答），其行为：
+
+- 若该物理页面在页表中存在，则将其填入TLB并且返回异常发生处继续执行
+- 若该物理页面不存在，则重新分配
+
+​		举这个例子是为了便于我们理解写时复制机制的作用原理，其也是依靠异常处理来实现的。在`traps_init()`函数中这一异常的码号为1，对应的异常处理函数为`handle_mod`，不过这个函数不使用汇编语言完成的，而是实现为`lib/traps.c`中的`page_fault_handler()`函数。这一函数主要负责保存现场，以及设置`tf->cp0_epc`的值为`env_pgfault_handler`即异常处理函数的地址。
+
+```C
+void page_fault_handler(struct Trapframe *tf)
+{
+    struct Trapframe PgTrapFrame;
+    extern struct Env *curenv;
+
+    bcopy(tf, &PgTrapFrame, sizeof(struct Trapframe));
+
+    if (tf->regs[29] >= (curenv->env_xstacktop - BY2PG) &&
+        tf->regs[29] <= (curenv->env_xstacktop - 1)) {
+            tf->regs[29] = tf->regs[29] - sizeof(struct  Trapframe);
+            bcopy(&PgTrapFrame, (void *)tf->regs[29], sizeof(struct Trapframe));
+        } else {
+            tf->regs[29] = curenv->env_xstacktop - sizeof(struct  Trapframe);
+            bcopy(&PgTrapFrame,(void *)curenv->env_xstacktop - sizeof(struct  Trapframe),sizeof(struct Trapframe));
+        }
+    // TODO: Set EPC to a proper value in the trapframe
+    tf->cp0_epc = curenv->env_pgfault_handler;
+    return;
+}
+```
+
+​		当然，上面提到，这个函数并没有实现页面复制，它只是将现场保存到了异常处理栈中，并在`cp0_epc`中设置了一个新的异常处理函数，以便跳转执行。跳转到的函数使定义在`fork.c`中的`pgfault()`函数。
+
+- 判断页面是否为COW标记页面，不是则`panic`
+- 分配临时物理页，将内容拷贝到该页面
+- 将发生异常写入的地址映射到新分配的临时页面，设置权限位，并解除临时页面的映射
+
+```C
+static void pgfault(u_int va)
+{
+		u_int *tmp;
+  	/* 取出权限位，并判断 */
+		u_int perm = (*vpt)[VPN(va)] & 0xfff;
+		if((perm & PTE_COW) == 0) {
+				user_panic("Not a COW page!\n");
+				return;
+		}
+		tmp = USTACKTOP;
+  	/* 将发生异常的地址进行页对齐 */
+		va = ROUNDDOWN(va ,BY2PG);
+  	/* 在USTACKTOP适用系统调用分配页面 */
+		if(syscall_mem_alloc(0 ,tmp ,PTE_V | PTE_R) < 0) {
+				user_panic("Failed to alloc!\n");
+				return;
+		}
+		/* 拷贝页面内容 */
+		user_bcopy((void *)va ,(void *)tmp ,BY2PG);
+		/* 映射临时页面到异常页面 */
+		if(syscall_mem_map(0, tmp, 0, va, PTE_V | PTE_R) < 0) {
+				user_panic("Failed to map!\n");	
+				return;
+		}
+		/* 解除临时页面的映射 */
+		if(syscall_mem_unmap(0 ,tmp) < 0) {
+				user_panic("Failed to unmap!\n");
+				return;
+		}
+		return;
+}
+```
+
+​		`page_fault_handler()`函数没有进行页面复制的操作，相关操作实现在用户态函数`pgfault()`中。如果我们要在用户态实现异常处理操作，那么我们就不能使用正常的堆栈，因为正常的堆栈也可能会发生写入异常。为此，我们在内存布局中为进程分配了一个**异常处理栈**，在`UXSTACKTOP`的位置。父子进程都需要在fork函数中设置自己的异常处理栈：
+
+```C
+//父进程异常处理栈设置，在sys_env_alloc()前
+set_pgfault_handler(pgfault);
+......
+//子进程异常处理栈设置，在sys_env_alloc()后
+if((ret = syscall_set_pgfault_handler(newenvid, __asm_pgfault_handler, UXSTACKTOP)) < 0)
+```
+
+​		然后，我们就能在发生异常的时候，通过`page_fault_handler()`函数存取异常处理栈了。我们一起来看一下这两个设置函数。
+
+```C
+void set_pgfault_handler(void (*fn)(u_int va))
+{
+  	/* 如果__pgfault_handler未被设置过，则设置。该变量是一个汇编宏 */
+  	if (__pgfault_handler == 0) {
+      	/* 分配异常处理栈以及处理程序__asm_pgfault_handler，该处理程序是一个汇编函数。
+         * 使用系统调用为进程控制块设置 */
+    		if (syscall_mem_alloc(0, UXSTACKTOP - BY2PG, PTE_V | PTE_R) < 0 ||
+      	syscall_set_pgfault_handler(0, __asm_pgfault_handler, UXSTACKTOP) < 0) {
+      			writef("cannot set pgfault handler\n");
+      		return;
+    		}
+  	}
+  	/* 设置内核处理函数为pgfault */
+  	__pgfault_handler = fn;
+}
+
+int sys_set_pgfault_handler(int sysno, u_int envid, u_int func, u_int xstacktop)
+{
+    struct Env *env;
+    int ret;
+  	/* 安全地获取进程控制块 */
+    if((ret = envid2env(envid ,&env ,0)) < 0) return ret;
+  	/* 设置进程控制块的异常栈的值以及异常处理函数入口为__asm_pgfault_handler */
+    env->env_xstacktop = xstacktop;
+    env->env_pgfault_handler = func;
+    return 0;
+}
+```
+
+​		可以看到，前一个函数实质上也是调用了后一个函数进行设置；而后一个函数有一点引人注目的地方，就是其异常处理函数`__asm_pgfault_handler`，这是定义在`entry.S`中的一个汇编函数。这些值都在前面向内存中写好了，汇编函数只需从内储存取即可。
+
+```C
+/* 从内核返回后，栈指针的值在Trapframe的底部 */
+__asm_pgfault_handler:
+lw      a0, TF_BADVADDR(sp)		//将发生写入异常的地址传入参数寄存器
+lw      t1, __pgfault_handler	//将异常处理函数入口写入t1
+jalr    t1										//跳转至该函数
+nop
+/* 恢复现场 */
+lw      v1, TF_LO(sp)
+mtlo    v1
+lw      v0, TF_HI(sp)
+lw      v1, TF_EPC(sp)
+mthi    v0
+mtc0    v1, CP0_EPC
+lw      $31, TF_REG31(sp)
+
+lw      $1, TF_REG1(sp)
+lw      k0, TF_EPC(sp)
+jr      k0
+lw      sp, TF_REG29(sp)
+```
+
+​		到这里，父进程当中有关子进程的信息都已经设置完毕，我们只需要将子进程唤醒，并且插入到就绪队列中即可。
+
+```C
+int sys_set_env_status(int sysno, u_int envid, u_int status)
+{
+    struct Env *env;
+    int ret;
+    /* 判断传入参数status是否合法 */
+    if((status != ENV_RUNNABLE) && (status != ENV_NOT_RUNNABLE) && (status != ENV_FREE)) {
+        return -E_INVAL;
+    }
+    /* 安全获得进程控制块 */
+    if((ret = envid2env(envid ,&env ,1)) < 0) return ret;
+    /* 如果要设置的进程状态为ENV_RUNNABLE并且目标进程的状态不是ENV_RUNNABLE
+     * 那么将该进程控制块插入至env_sche_list[0]的尾部；反之，将该控制块从该队
+     * 列中移除 */
+    if (status == ENV_RUNNABLE && env->env_status != ENV_RUNNABLE) {
+        LIST_INSERT_TAIL(&env_sched_list[0], env, env_sched_link);
+    } else if (status != ENV_RUNNABLE && env->env_status == ENV_RUNNABLE) {
+        LIST_REMOVE(env, env_sched_link);
+    }
+    /* 现在可以修改进程控制块的状态了 */
+    env->env_status = status; 
+    return 0;
+}
+```
+
+​		将以上的各个步骤组合在`fork.c`函数中，我们的任务就完成了。
+
+```C
+int fork(void)
+{
+    u_int newenvid;
+    extern struct Env *envs;
+    extern struct Env *env;
+    u_int i;
+    u_int ret = 0;
+
+    /* 设置父函数的写入异常机制 */
+    set_pgfault_handler(pgfault);
+    /* 使用系统调用声明一个新的进程控制块 */
+    newenvid = syscall_env_alloc();
+    if(newenvid == 0) {
+        env = &envs[ENVX(syscall_getenvid())];
+        return 0;
+    }
+    /* 映射用户空间页面 */
+    for(i = 0;i < USTACKTOP;i += BY2PG) {
+        if((Pde *)(*vpd)[i >> PDSHIFT]) {
+            if((Pte *)(*vpt)[i >> PGSHIFT]) {
+                duppage(newenvid, VPN(i));
+            }
+        }
+    }
+  	/* 设置程序异常栈 */
+    if((ret = syscall_mem_alloc(newenvid, UXSTACKTOP - BY2PG, PTE_V | PTE_R)) < 0)
+        return ret;
+    if((ret = syscall_set_pgfault_handler(newenvid, __asm_pgfault_handler, UXSTACKTOP)) < 0)
+        return ret;
+    if((ret = syscall_set_env_status(newenvid, ENV_RUNNABLE)) < 0)
+        return ret;
+    return newenvid;
+}
+```
+
+### Thinking 4.7
+
+​		首先，我查询了一下"中断重入"这一概念的意思，得到的结论大致是：中断的时候发生了中断。我大致讲一下我的理解。对于我们的MOS操作系统来说，页写入异常和缺页异常是两种不同的TLB异常。当我们想从TLB中调取页面但是发生中断的时候，我们就会进入内存或者磁盘寻找页面并且将其调入TLB。倘若我们遇到了一种更糟糕的情况：进程出发了页写入异常，我们不得不进入中断并且为其分配页面；然而我们分配的页面不在TLB中，上一个中断却还没有服务完，操作系统不得不再进入一层中断。这应该是可能发生"中断重入"的原因，归纳地来讲，就是连续的重叠的中断所致。
+
+​		MOS实现的是微内核，它将缺页异常的主要部分置于用户态下处理。用户需要依靠Trapframe的信息执行中断处理和恢复现场，故而我们将其保存在用户的"异常处理栈"中
+
+### Thinking 4.8
+
+​		在用户态处理页写入异常符合微内核的设计理念，能够精简内核大小，同时也使该异常处理起来更加方便，性能更好。
+
+​		第二问不是很理解题目的意思。从寄存器的使用方式来讲，在用户态可能发生指令跳转的情况时，将寄存器的内容依照栈指针寄存器sp的目标依次压入栈中，最后再跳转；恢复现场时，先取出sp寄存器的值，并依照其重定位恢复寄存器的值，最后再跳转。这样使用可以保证栈指针的安全性，从而使得通用寄存器在栈中有安全的备份。标准操作可参见`entry.S`中的汇编函数。
+
+### Thinking 4.9
+
+​		父进程在调用系统调用创建子进程的时候，可能会提前出现缺页中断，需要设置缺页处理条件。
+
+​		父进程会给`__pgfault_handler`变量赋值时，会触发缺页中断。由于没有提前配置中断处理，无法处理这样的缺页中断。
+
+​		不需要，子进程与父进程共享这个值。
+
+### 6.小结
+
+​		这一部分的顺序有点混乱，不管是指导书还是本片笔记，第一次阅读的时候都会觉得比较吃力。我本人也是在勉强填完代码后再次阅读才能整理出一些零散的思路。为了不让这些宝贵的思路流失，以便于我日后复习，我现在把这一部分的梳理记录下来。
+
+​		我们在这一部分实际上是完成的任务主要达到了两个目的：
+
+- 完成fork功能，设置好父子进程的信息，完善写时复制机制
+- 完善写时复制时的异常处理功能，或是说系统调用
+
+#### Fork功能
+
+​		在调用fork函数的时候，父进程先要设置自己的异常处理栈，并且调用系统调开辟子进程，子进程初始处于阻塞状态，等待父进程唤醒。
+
+```C
+set_pgfault_handler(pgfault);
+newenvid = syscall_env_alloc();
+```
+
+​		父进程继续设置子进程的一系列信息（包括写时复制机制，父进程调用系统调用为子进程设置）并在最后将子进程唤醒。此时父子进程就可以并发执行了。写时复制机制的设置过程如下：
+
+#### 写入时异常
+
+​		父子进程在修改被`PTE_COW`保护的页面时，会触发写入时异常。处理的流程如下：
+
+- 在异常向量组中注册`handle_mod`异常
+- 保存`tf`至异常处理栈
+- 进入`__asm_pgfault_handler`汇编函数，在内存中取出函数值，并跳转到`pgfault()`函数
+- `pgfault()`函数处理，判断异常并进行页面拷贝
+- 逐层返回
