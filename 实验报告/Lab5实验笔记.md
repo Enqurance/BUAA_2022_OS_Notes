@@ -762,3 +762,276 @@ int read(int fdnum, void *buf, u_int n)
 ```
 
 ​		`read()`函数和本文件下的另一个`write()`函数非常相似，只需要照猫画虎即可。
+
+### Thinking 5.9
+
+​		在`fs`目录下，新建一个`helloworld`文件，并通过修改Makefile将其挂载在磁盘镜像中。同时编写测试程序，在`fork()`之后得到文件描述符并打印输出，可以发现父子进程仍旧共享文件描述符。
+
+```C
+void umain() {
+    int r;
+    int fdnum;
+    if ((r = open("/newmotd", O_RDWR)) < 0) {
+        user_panic("open /newmotd: %d", r);
+    }
+    writef("envid : %d ,fdnum : %d\n", syscall_getenvid(), r);
+    fdnum = r;
+    char *str = "Hello World!";
+    if ((r = write(fdnum, str, strlen(str))) < 0) {
+        user_panic("write /newmotd: %d", r);
+    }
+    fork();
+    if ((r = open("/helloworld", O_RDWR)) < 0) {
+        user_panic("open /helloworld: %d", r);
+    }
+    fdnum = r;
+    writef("%s\n", str);
+    if ((r = write(fdnum, str, strlen(str))) < 0) {
+        user_panic("write /helloworld: %d", r);
+    }
+    writef("envid : %d ,fdnum : %d\n", syscall_getenvid(), r);
+}
+```
+
+​		随后在本地的编译器中编写C语言文件：
+
+```C
+#include <unistd.h>
+#include "stdio.h"
+
+int main() {
+    FILE *f;
+    f = fopen("in.txt", "r");
+    fseek(f, 0, 0);
+    fork();
+    printf("env_id : %d ,f : %d\n", getppid(), f);
+}
+```
+
+​		发现父子进程共享文件定位指针。
+
+### Thinking 5.10
+
+```C
+/* Fd结构体表示文件描述符，供用户使用，是单纯的内存数据 */
+struct Fd {
+    u_int fd_dev_id;			//该文件所处的设备编号(id)
+    u_int fd_offset;			//该文件在设备中的偏移
+    u_int fd_omode;				//该文件的打开模式
+};
+
+/* Filefd结构体表示文件描述符和文件，供用户使用，是单纯的内存数据 */
+struct Filefd {
+    struct Fd f_fd;				//某个文件的文件描述符
+    u_int f_fileid;				//打开该文件的文件id
+    struct File f_file;		//该文件的文件控制块
+};
+
+/* 仅定义在serv.c中的结构体，仅由文件系统使用，用于保存已打开的文件，是单纯的内存数据 */
+struct Open {
+    struct File *o_file;	//所打开文件的文件控制块的指针
+    u_int o_fileid;     	//所打开文件的文件id
+    int o_mode;     			//所打开文件的打开方式
+    struct Filefd *o_ff;  //该文件描述符在文件进程中的虚拟地址
+};
+```
+
+​		这三个结构体都是在内存中的数据，围绕文件系统和用户进程定义，用于协助文件系统的实现；同时他们也是硬件中的文件在软件中的抽象映像。
+
+### 3.文件系统服务
+
+​		MOS操作系统中，文件系统通过IPC（进程通信）机制为其他进程提供服务。内核开始运行时，文件系统便被创建；而文件系统也有一系列的初始化机制，保证其能够正常地为其他进程提供服务。借用指导书上的UML时序图来描述文件系统服务用户进程的流程。
+
+![6901654512271_.pic](/Users/enqurance/Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support/com.tencent.xinWeChat/2.0b4.0.9/8595b9ac6731cc4fd34dd896c9aacf68/Message/MessageTemp/9e20f478899dc29eb19741386f9343c8/Image/6901654512271_.pic.jpg)
+
+​		具体到细节，用户程序向文件系统发出操作请求时，会将请求的内容放在一系列`fsreq`结构体中进行消息的传递。文件系统进程收到IPC请求后，可以根据请求所传递的参数和要求执行相应的文件操作，并将结果通过IPC机制反馈给用户进程。
+
+​		`user/fsipc.c`操作中定义了请求文件系统使用到的一系列IPC操作，`user/file.c`重则定义了提供给用户程序的读写、创建、删除、修改文件的接口。
+
+```C
+/* file.c提供给用户的文件系统接口 */
+/* open()函数，前面已经介绍过，用于打开某路径下的文件，成功打开则返回其文件标识符 */
+int open(const char *path, int mode);	
+
+/* 关闭一个文件标识符 */
+int file_close(struct Fd *fd)
+{
+    int r; 
+    struct Filefd *ffd;
+    u_int va, size, fileid;
+    u_int i;
+		/* "经典"类型转换 */
+    ffd = (struct Filefd *)fd;
+    fileid = ffd->f_fileid;
+    size = ffd->f_file.f_size;
+		/* 得到文件表示符映射数据的虚拟地址 */
+    va = fd2data(fd);
+    /* 告知文件系统哪些页面为脏页，即被修改过的页面 */
+    for (i = 0; i < size; i += BY2PG) {
+        fsipc_dirty(fileid, i);
+    }
+		/* 使用IPC机制，告知文件系统需要关闭的文件id */
+    if ((r = fsipc_close(fileid)) < 0) {
+        writef("cannot close the file\n");
+        return r;
+    }
+    /* 解除文件在内存中的映射，释放内存 */
+    if (size == 0) {
+        return 0;
+    }
+  	/* 按照文件大小，逐一取消页面映射 */
+    for (i = 0; i < size; i += BY2PG) {
+        if ((r = syscall_mem_unmap(0, va + i)) < 0) {
+            writef("cannont unmap the file.\n");
+            return r;
+        }
+    }
+    return 0;
+}
+
+/* 从fd指向的文件标识符对应的文件读取n字节的数据至缓冲区，位置由seek pointer决定 */
+static int file_read(struct Fd *fd, void *buf, u_int n, u_int offset)
+{
+    u_int size;
+    struct Filefd *f;
+    f = (struct Filefd *)fd;
+		/* 获取文件大小 */
+    size = f->f_file.f_size;
+		/* 偏移大于文件大小，返回0 */
+    if (offset > size) {
+        return 0;
+    }
+		/* 读取最后的长度大于文件大小，则只需读到文件末尾 */
+    if (offset + n > size) {
+        n = size - offset;
+    }
+		/* 进行拷贝，读取完成 */
+    user_bcopy((char *)fd2data(fd) + offset, buf, n);
+    return n;
+}
+
+/* 将n字节的数据从缓冲区写至fd指向的文件表示符对应的文件，位置同样由seek point决定 */
+static int file_write(struct Fd *fd, const void *buf, u_int n, u_int offset)
+{
+    int r; 
+    u_int tot;
+    struct Filefd *f;
+    f = (struct Filefd *)fd;
+		/* tot为写完后的文件大小 */
+    tot = offset + n;
+    /* 写后溢出，返回错误码。此处溢出指的是超出了文件大小的最大上限 */    
+    if (tot > MAXFILESIZE) {
+        return -E_NO_DISK;
+    }
+		/* 如果本次写操作将使文件增大，则增加文件大小 */
+    if (tot > f->f_file.f_size) {
+        if ((r = ftruncate(fd2num(fd), tot)) < 0) {
+            return r;
+        }
+    }
+		/* 进行拷贝，完成写操作 */
+    user_bcopy(buf, (char *)fd2data(fd) + offset, n);
+    return n;
+}
+
+/* 截断或增长文件大小，使之等于size。这个函数比较长，不在此解读了 */
+int ftruncate(int fdnum, u_int size)
+
+/* 按照路径，删除一个文件或者目录 */
+int remove(const char *path)
+{
+		/* 直接调用fsipc.c中的函数即可 */
+    return fsipc_remove(path);
+}
+```
+
+​		这上面的函数中，`remove()`函数是我们需要完成的函数。不过它十分简单，只需要我们调用一个定义在`fsipc.c`中的函数即可。既然这个文件中的函数也有这么强大的功能，下面我们就来解读一下它的部分代码。
+
+```C
+/* 传递type和fsreq至文件系统进程，其中type使用value传递。dstva为接受返回数据的虚拟地址，perm为该虚拟地址对应的页面的权限 */
+static int fsipc(u_int type, void *fsreq, u_int dstva, u_int *perm)
+{
+    u_int whom;
+    /* 使用ipc_send()发送数据 */
+    ipc_send(envs[1].env_id, type, (u_int)fsreq, PTE_V | PTE_R);
+  	/* 等待进程通信返回结果 */
+    return ipc_recv(&whom, dstva, perm);
+}
+
+/* 按照路径path和打开方式omode打开文件，上文已介绍 */
+int fsipc_open(const char *path, u_int omode, struct Fd *fd);
+
+/* 告知文件系统进程设置文件的大小 */
+int fsipc_set_size(u_int fileid, u_int size)
+{
+    struct Fsreq_set_size *req;
+		/* req使用某个结构体，作为想文件系统发出某种请求的媒介 */
+    req = (struct Fsreq_set_size *)fsipcbuf;
+  	/* 设置结构体的信息 */
+    req->req_fileid = fileid;
+    req->req_size = size;
+  	/* 通过fsipc函数传递操作类型(FSREQ_SET_SIZE)及细节数据(req) */
+    return fsipc(FSREQ_SET_SIZE, req, 0, 0);
+}
+
+/* 告知文件系统进程将某文件下的某个块标记为脏，即已修改 */
+int fsipc_dirty(u_int fileid, u_int offset)
+{
+    struct Fsreq_dirty *req;
+		/* 同样，使用另外一个结构体传递信息 */
+    req = (struct Fsreq_dirty *)fsipcbuf;
+    req->req_fileid = fileid;
+    req->req_offset = offset;
+  	/* 通过fsipc函数传递操作类型以及细节数据 */
+    return fsipc(FSREQ_DIRTY, req, 0, 0);
+}
+
+/* 告知文件系统按照路径删除某个文件 */
+int fsipc_remove(const char *path)
+{
+    struct Fsreq_remove *req;
+  	/* 首先，检查文件路径是否合法 */
+    if (strlen(path) >= MAXPATHLEN) return -E_BAD_PATH;
+    /* 使用合适的结构体，存放细节数据 */
+    req = (struct Fsreq_remove *)fsipcbuf;
+    /* 结构体中需要存放的细节数据为文件路径 */
+    strcpy((char *)req->req_path, path);
+    /* 使用fsipc()函数向文件系统发出请求 */
+    return fsipc(FSREQ_REMOVE, req, 0, 0);
+}
+```
+
+​		简单阅读了几个函数，发现他们的工作流程大致相同：将缓冲区`fsipcbuf`转型为相应的结构体指针，赋值给`req`并向其中存放细节数据，然后调用`fsipc()`函数向文件系统请求服务，注意所请求服务的类型。
+
+​		最后，我们还需要在文件系统中添加对应的服务函数，以此完善文件系统的功能。
+
+```C
+void serve_remove(u_int envid, struct Fsreq_remove *rq)
+{
+    int r; 
+    u_char path[MAXPATHLEN];
+   	/* 拷贝路径，并在最后加上\0 */
+    user_bcopy(rq->req_path, path, MAXPATHLEN);
+    path[MAXPATHLEN - 1] = '\0';    
+  	/* 调用文件系统的函数file_remove()删除该文件，同时利用IPC机制向用户进程发送服务完成的信息，唤醒用户进程并告知服务结果 */
+    if((r = file_remove(path)) < 0) ipc_send(envid, r, 0, 0);
+    ipc_send(envid, 0, 0, 0);
+}
+```
+
+​		这便是完成文件系统服务的一套流程。
+
+### Thinking 5.11
+
+​		图中有三类箭头，代表UML类图中的三类消息：
+
+- 黑色三角+实线+实心黑点组成的箭头。这类消息可能没有发送者或接受者。
+- 黑色三角+实线组成的箭头。表示同步消息，发送者发送消息后，暂停活动等待接受者响应。
+- 开三角+虚线组成的箭头。表示返回消息，和同步消息一并使用。
+
+​		在前面的实验中，我们已经实现了IPC机制，不同进程之间可以通过IPC机制进行通信。我们的文件系统对应的进程控制块为`envs[1]`，可以通过这个控制块的信息从而使用IPC机制在用户进程和文件系统进程之间实现进程通信。
+
+### Thinking 5.12
+
+​		这一循环，每次都会调用`ipc_recv()`函数，以检测其他进程是否向文件系统进程发送数据，倘若有，则响应；倘若没有，则阻塞。这一循环不会使CPU陷入忙等，且文件系统进程为用户进程，不会损害到内核；MOS系统结束运行时，该进程会被`kill`而不会长期存在。
+
